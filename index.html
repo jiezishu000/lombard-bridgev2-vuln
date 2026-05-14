@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lombard Finance BridgeV2 — CEI Vulnerability Disclosure</title>
+<meta name="description" content="Medium-severity CEI violation in Lombard Finance BridgeV2: payloadSpent flag set before withdrawal can permanently lock cross-chain LBTC.">
+<meta name="keywords" content="Lombard Finance, BridgeV2, Solidity, CEI, vulnerability, smart contract, security">
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --text: #c9d1d9; --accent: #58a6ff; --border: #30363d; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Helvetica,Arial,sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+  .container { max-width: 800px; margin: 0 auto; padding: 2rem 1rem; }
+  h1 { font-size: 2rem; margin: 1rem 0; color: #fff; }
+  h2 { font-size: 1.5rem; margin: 2rem 0 1rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: .5rem; }
+  h3 { font-size: 1.2rem; margin: 1.5rem 0 .5rem; color: #fff; }
+  p { margin: 1rem 0; }
+  a { color: var(--accent); }
+  .badge { display: inline-block; padding: .25em .75em; border-radius: 2em; font-size: .85rem; font-weight: 600; margin: 0 .25rem; }
+  .badge-red { background: var(--red); color: #fff; }
+  .badge-green { background: var(--green); color: #fff; }
+  .badge-yellow { background: var(--yellow); color: #000; }
+  pre { background: #1c2128; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-family: 'Fira Code','Cascadia Code','JetBrains Mono',monospace; font-size: .9rem; margin: 1rem 0; }
+  code { font-family: 'Fira Code','Cascadia Code','JetBrains Mono',monospace; background: #1c2128; padding: .1em .3em; border-radius: 3px; font-size: .9em; }
+  pre code { background: none; padding: 0; }
+  .severity { display: flex; gap: 1rem; align-items: center; margin: 2rem 0; padding: 1rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+  .severity-label { font-weight: 700; font-size: .85rem; text-transform: uppercase; letter-spacing: .05em; color: var(--yellow); }
+  .severity-value { font-weight: 700; font-size: 1.2rem; }
+  .impact-box { background: var(--card); border: 1px solid #f8514933; border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; }
+  .impact-box .check { color: var(--green); }
+  .impact-box .cross { color: var(--red); }
+  .impact-box .lock { color: var(--yellow); }
+  .donate-section { background: var(--card); border: 1px solid var(--accent); border-radius: 8px; padding: 1.5rem; margin: 2rem 0; text-align: center; }
+  .donate-section h2 { border: none; margin-top: 0; }
+  .wallet-addr { font-family: 'Fira Code','Cascadia Code','JetBrains Mono',monospace; font-size: .85rem; background: #1c2128; padding: .75rem; border-radius: 6px; word-break: break-all; border: 1px solid var(--border); margin: .5rem 0; user-select: all; }
+  .timeline { list-style: none; padding: 0; }
+  .timeline li { padding: .5rem 0 .5rem 1.5rem; border-left: 2px solid var(--border); margin: 0; position: relative; }
+  .timeline li::before { content: ''; position: absolute; left: -6px; top: 1rem; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  .cta-button { display: inline-block; padding: .75rem 1.5rem; background: var(--accent); color: #fff; font-weight: 600; border-radius: 6px; text-decoration: none; margin: .5rem; }
+  .cta-button:hover { filter: brightness(1.15); }
+  footer { text-align: center; padding: 2rem 0; color: #8b949e; font-size: .85rem; border-top: 1px solid var(--border); margin-top: 3rem; }
+</style>
+</head>
+<body>
+<div class="container">
+  <span class="badge badge-yellow">Medium Severity</span>
+  <span class="badge badge-red">CEI Violation</span>
+  <span class="badge badge-green">PoC Available</span>
+
+  <h1>How a Single Line of Solidity Can Permanently Lock Cross-Chain LBTC</h1>
+  <p><em>A CEI Violation in Lombard Finance's BridgeV2</em></p>
+
+  <hr style="border-color:var(--border);margin:1.5rem 0">
+
+  <h2>TL;DR</h2>
+  <p>Lombard Finance's <code>BridgeV2.handlePayload()</code> sets a "spent" flag <strong>before</strong> executing the withdrawal. If the withdrawal fails for any reason, the user's LBTC is permanently stuck with no way to retry.</p>
+  <p><strong>Root Cause</strong>: CEI (Checks-Effects-Interactions) pattern violation — one line of code in the wrong order.</p>
+
+  <div class="severity">
+    <div>
+      <div class="severity-label">Immunefi V2.2 Classification</div>
+      <div class="severity-value">Medium — Permanent Fund Freezing</div>
+    </div>
+  </div>
+
+  <h2>The Vulnerability</h2>
+  <p>The bug is in <code>BridgeV2.handlePayload()</code>:</p>
+  <pre><code>function handlePayload(Payload calldata payload) external {
+    // ... validation ...
+
+    // LINE ~593: Mark as spent BEFORE withdrawal
+    $.payloadSpent[payload.id] = true;
+
+    // ... later ...
+    _withdraw($, chainToAddress, payload);  // This can fail!
+}</code></pre>
+  <p>The <code>payloadSpent[payload.id] = true</code> assignment acts as a replay-protection flag — once set, the same payload cannot be processed again. This is standard for cross-chain bridges.</p>
+  <p><strong>The problem</strong>: It's set <em>before</em> the withdrawal executes, not after.</p>
+
+  <h2>Impact: Permanent Fund Lock</h2>
+  <div class="impact-box">
+    <p>If <code>_withdraw()</code> reverts for any reason:</p>
+    <ol>
+      <li><strong>Out of gas</strong>: Cross-chain calls often have complex execution paths. If the destination chain runs out of gas mid-execution, the withdrawal fails but <code>payloadSpent</code> is already <code>true</code>.</li>
+      <li><strong>Recipient contract rejects</strong>: If the destination address is a smart contract whose <code>onERC721Received()</code> (or similar hook) reverts, the withdrawal fails — but the payload is marked spent.</li>
+      <li><strong>Bridge paused</strong>: If the bridge is paused between the <code>payloadSpent</code> assignment and the <code>_withdraw</code> call.</li>
+      <li><strong>Any unexpected revert</strong>: Any error in <code>_withdraw</code> means the funds are stuck.</li>
+    </ol>
+    <br>
+    <p><span class="check">✅</span> <code>payloadSpent[payload.id] = true</code> (cannot retry)<br>
+    <span class="cross">❌</span> <code>_withdraw()</code> never completed (funds not delivered)<br>
+    <span class="lock">🔒</span> <strong>Result: LBTC permanently locked in the bridge contract</strong></p>
+  </div>
+
+  <h2>The Fix</h2>
+  <p>Move the state change after the external interaction:</p>
+  <pre><code>// First, execute the withdrawal
+_withdraw($, chainToAddress, payload);
+
+// Then, mark as spent (Effects after Interactions)
+$.payloadSpent[payload.id] = true;</code></pre>
+  <p>This follows the standard CEI (Checks-Effects-Interactions) pattern that every Solidity developer should know. If <code>_withdraw</code> fails, the transaction reverts entirely, and <code>payloadSpent</code> is never set — the user can retry.</p>
+
+  <h2>Proof of Concept</h2>
+  <p>Full PoC available in the <a href="https://github.com/jiezishu000/lombard-bridgev2-vuln">GitHub repository</a>.</p>
+  <p>The PoC demonstrates:</p>
+  <ol>
+    <li>Deploy a mock BridgeV2 with the vulnerable <code>handlePayload</code></li>
+    <li>Simulate a withdrawal that reverts (e.g., out-of-gas or recipient rejection)</li>
+    <li>Show that <code>payloadSpent</code> is <code>true</code> but funds were never delivered</li>
+    <li>Attempt to retry — blocked by the spent flag</li>
+    <li>Apply the fix and verify the issue is resolved</li>
+  </ol>
+
+  <h2>Severity</h2>
+  <p>Per Immunefi's V2.2 classification:</p>
+  <ul>
+    <li><strong>Theft of funds</strong>: Not directly — an attacker cannot steal funds with this bug</li>
+    <li><strong>Permanent freezing of funds</strong>: Yes — qualifies under "Permanent locking of funds without recovery"</li>
+    <li><strong>Impact</strong>: User funds can be permanently frozen in the bridge contract</li>
+  </ul>
+
+  <h2>Disclosure Timeline</h2>
+  <ul class="timeline">
+    <li><strong>2026-05-13</strong>: Vulnerability discovered during routine code review</li>
+    <li><strong>2026-05-14 01:38 UTC</strong>: Submitted to Lombard Finance via GitHub Issue #35</li>
+    <li><strong>2026-05-14</strong>: Added full technical details with PoC reference</li>
+  </ul>
+
+  <!-- Donation Section -->
+  <div class="donate-section">
+    <h2>Support Security Research</h2>
+    <p>If this disclosure helped protect your protocol or taught you something valuable, consider supporting independent security research.</p>
+    <p style="font-size:0.9rem;color:#8b949e">Suggested donation: 1 USDT</p>
+    <div class="wallet-addr">0x1b6C028199952eE1a8079dB02acfFCCfC881f76d</div>
+    <p style="font-size:0.85rem;color:#8b949e">Polygon network — USDT preferred</p>
+    <p style="margin-top:1.5rem">
+      <a href="https://github.com/jiezishu000/lombard-bridgev2-vuln" class="cta-button">View on GitHub</a>
+      <a href="FIX.md" class="cta-button">View Remediation Guide</a>
+    </p>
+  </div>
+
+  <p><em>This disclosure is published for educational purposes. Always follow the CEI pattern in your Solidity code.</em></p>
+
+  <footer>
+    <p>Independent Security Research | <a href="https://github.com/jiezishu000">@jiezishu000</a></p>
+  </footer>
+</div>
+</body>
+</html>
